@@ -96,7 +96,7 @@ body.online-lobby-mode.net-guest #missionPane select:disabled,body.online-lobby-
 </div>
 
 <div id="menu" class="screen">
-<header><div class="brand"><i></i>IRON FRONT <span style="color:#83968e">/</span> COVER & EMBER</div><span class="version">BUILD 10.80 · ONLINE FEEDBACK FIX · BALANCE LAB</span></header>
+<header><div class="brand"><i></i>IRON FRONT <span style="color:#83968e">/</span> COVER & EMBER</div><span class="version">BUILD 10.90 · CLIENT SYNC HARDENED · BALANCE LAB</span></header>
 <section class="intro"><div class="eyebrow">NO LOCK. READ THE BATTLE.</div><h1>IRON<br><span>FRONT</span></h1><h2>鋼 殻 戦 線</h2><p>先に見つけ、射線をつくる。<br>発射の予兆を読み、斜面に身を隠す。<br>５機の役割が、戦線を動かす。</p><div class="feature"><span>INERTIA / MASS</span><span>SHARED VISION</span><span>5 vs 5</span></div><div class="doctrine"><b>カメラは自由。照準は機体に従う。</b><br>長い装填と発射ディレイを、仲間で補う。<br>３つの通信区域を奪い、戦況を変えろ。</div></section>
 <div class="hangar-tag"><div class="eyebrow" id="editLabel">A-01 / YOUR COMBAT FRAME</div><strong id="frameCode"></strong><small id="frameRole"></small><div class="hangar-stats"><span>ARMOR / HP<b id="menuHP"></b></span><span>SPEED / m/s<b id="menuSpeed"></b></span><span>TURN / °/s<b id="menuTurn"></b></span></div></div>
 <div class="hangar-action"><button id="poseBtn">射撃姿勢</button><button id="rotateBtn">回転を停止</button></div>
@@ -2461,6 +2461,113 @@ window.__ironNet=NET;
 })();
 
 for(const [id,data] of [['frameSel',FRAMES],['mainSel',GUNS],['shoulderSel',SHOULDERS],['gadgetSel',GADGETS]])$(id).innerHTML=data.map((v,i)=>'<option value="'+i+'">'+v.name+'</option>').join('');
+
+// ---------- v10.9 CLIENT AIM / LOBBY PRIVACY / PROJECTILE HARDENING ----------
+(function installNetV109(){
+ if(!window.__ironNet)return;
+ const NET=window.__ironNet;
+ const DIRECT_MISSILE_KINDS=new Set(['missile','bomblet','beacon','smokePod']);
+ const isDirectVisual=b=>!!b&&!b.plan&&!b.homing&&!DIRECT_MISSILE_KINDS.has(b.kind);
+ const isRemoteArtillery=(f,d)=>!!f&&f.gun?.type==='grenade'&&!!(d?.artillery||d?.right)&&Array.isArray(d?.artilleryTarget||d?.aim);
+ const safeArtilleryTarget=(f,d)=>NET.safePoint(d?.artilleryTarget||d?.aim,f);
+ function applyArtilleryAim(f,target){
+  const t=NET.safePoint(target,f),sol=solveArtillery(f,t,true),from=muzzle(f);
+  f.artillerySolution=sol;f._remoteArtilleryTarget=[...t];
+  f.aimPoint=V.add(from,V.mul(sol.dir,Math.max(30,f.gun.range)));
+  return sol;
+ }
+ function fireRemoteArtillery(f,target){
+  const sol=applyArtilleryAim(f,target);if(!sol)return false;
+  // The host is authoritative. Commit the exact ballistic direction represented by the
+  // client's artillery cursor instead of reinterpreting the ground point as a direct ray.
+  f.yaw=sol.yaw;f.pitch=sol.pitch;return shoot(f);
+ }
+
+ // Send the real artillery cursor/ground point. cameraAim may still be one render frame old
+ // immediately after a mouse movement, whereas artilleryFocus is updated directly by mouse input.
+ const input109Base=NET.inputPacket.bind(NET);
+ NET.inputPacket=function(){const p=input109Base();if(artillery&&player?.gun?.type==='grenade'&&Array.isArray(artilleryFocus)){p.artillery=true;p.artilleryTarget=[...artilleryFocus];p.aim=[...artilleryFocus];}return p;};
+ NET.sendAction=function(code){if(this.isHost||this.phase!=='match'||paused||!this.hostConn?.open)return;try{const isArt=artillery&&player?.gun?.type==='grenade'&&Array.isArray(artilleryFocus),aim=isArt?[...artilleryFocus]:cameraAim?.p?[...cameraAim.p]:player?[...player.aimPoint]:null;this.hostConn.send({t:'action',code,aim,artillery:isArt,artilleryTarget:isArt?[...artilleryFocus]:null});this.sendInput(true);}catch{}};
+
+ // Preserve the artillery flag on reliable action messages. The previous host handler kept only
+ // `code` and `aim`, losing the fact that the point was an artillery ground target.
+ const hostData109Base=NET.onHostData.bind(NET);
+ NET.onHostData=function(conn,d){
+  if(d?.t==='action'&&this.phase==='match'){
+   const m=this.members.get(conn.peer);if(!m)return;
+   const q=this.remoteActions.get(m.slot)||[];
+   q.push({code:d.code,aim:Array.isArray(d.aim)?d.aim:null,artillery:!!d.artillery,artilleryTarget:Array.isArray(d.artilleryTarget)?d.artilleryTarget:null});
+   if(q.length>24)q.splice(0,q.length-24);this.remoteActions.set(m.slot,q);return;
+  }
+  return hostData109Base(conn,d);
+ };
+
+ // Host-side input for every remote human. Artillery aim is converted to the same ballistic
+ // solution used by the local host player. All other weapons keep their existing semantics.
+ NET.remoteIntent=function(f,dt){
+  const d=this.remoteInputs.get(f.id),fresh=d&&performance.now()-d.received<350,keysSet=new Set(fresh&&Array.isArray(d.keys)?d.keys:[]),cam=Number.isFinite(d?.camYaw)?d.camYaw:f.yaw;
+  let x=(keysSet.has('KeyD')?1:0)-(keysSet.has('KeyA')?1:0),z=(keysSet.has('KeyW')?1:0)-(keysSet.has('KeyS')?1:0);const n=Math.hypot(x,z);if(n>1){x/=n;z/=n;}
+  const it={mx:Math.sin(cam)*z-Math.cos(cam)*x,mz:Math.cos(cam)*z+Math.sin(cam)*x,brake:!fresh,guard:keysSet.has('KeyE')&&f.gadget.type==='shield',jet:keysSet.has('ShiftLeft')&&f.cfg.ability==='jet'};f.intent=it;
+  if(fresh){if(isRemoteArtillery(f,d))applyArtilleryAim(f,safeArtilleryTarget(f,d));else if(Array.isArray(d.aim))f.aimPoint=this.safePoint(d.aim,f);}
+  const q=this.remoteActions.get(f.id)||[];
+  while(q.length){const a=q.shift(),artTarget=(a.artillery&&Array.isArray(a.artilleryTarget||a.aim))?this.safePoint(a.artilleryTarget||a.aim,f):null;if(artTarget)applyArtilleryAim(f,artTarget);else if(a.aim)f.aimPoint=this.safePoint(a.aim,f);
+   if(a.code==='ShiftLeft')ability(f);else if(a.code==='KeyR')reload(f,true);else if(a.code==='KeyQRelease'&&shoulderHoldPreviewEnabled(f.shoulder))shoulder(f,f.aimPoint);else if(a.code==='KeyQ'&&!shoulderHoldPreviewEnabled(f.shoulder))shoulder(f,f.aimPoint);else if(a.code==='KeyE'&&f.gadget.type!=='shield')gadget(f);else if(a.code==='Mouse0'||a.code==='KeyJ'){if(f.gun.type==='grenade'&&artTarget)fireRemoteArtillery(f,artTarget);else shoot(f);}}
+  if(f.gun.automatic&&fresh&&(d.left||keysSet.has('KeyJ')))shoot(f);return it;
+ };
+
+ // -------- Lobby loadout privacy --------
+ Object.assign(NET,{lobbyHiddenSlots:new Set(),ownerProjectileSeq:0,lastOwnerProjectileSeq:-1,pendingOwnerProjectileMotion:new Map()});
+ NET.redactLobbyForSlot=function(full,slot){const team=this.teamOf(slot),p=this.clone(full)||{};p.viewerTeam=team;p.loads=(full.loads||[]).map((l,i)=>this.teamOf(i)===team?this.cleanLoad(l):null);p.members=(full.members||[]).map(m=>({...m,load:this.teamOf(m.slot)===team?this.cleanLoad(m.load):null}));p.npcs=(full.npcs||[]).map(n=>({...n,load:this.teamOf(n.slot)===team?this.cleanLoad(n.load):null}));return p;};
+ NET.broadcastLobby=function(){if(!this.isHost)return;const full=this.lobbyPacket();this.applyLobbyPacket(full,true);for(const [peer,c] of this.connections){if(!c.open)continue;const m=this.members.get(peer),packet=this.redactLobbyForSlot(full,m?.slot??0);try{c.send(packet);}catch{}}};
+ const applyLobby109Base=NET.applyLobbyPacket.bind(NET);
+ NET.applyLobbyPacket=function(p){if(!p)return;this.lobbyHiddenSlots.clear();if(this.isHost)return applyLobby109Base(p);const team=Number.isInteger(p.viewerTeam)?p.viewerTeam:this.teamOf(this.localSlot),placeholder=this.cleanLoad(PRESETS.assault),q={...p};q.loads=(p.loads||[]).map((l,i)=>{if(l)return l;if(this.teamOf(i)!==team)this.lobbyHiddenSlots.add(i);return {...placeholder};});q.members=(p.members||[]).map(m=>{if(m.load)return m;if(this.teamOf(m.slot)!==team)this.lobbyHiddenSlots.add(m.slot);return {...m,load:{...placeholder}};});q.npcs=(p.npcs||[]).map(n=>{if(n.load)return n;if(this.teamOf(n.slot)!==team)this.lobbyHiddenSlots.add(n.slot);return {...n,load:{...placeholder}};});return applyLobby109Base(q);};
+ const renderLobby109Base=NET.renderLobby.bind(NET);
+ NET.renderLobby=function(){const r=renderLobby109Base();if(!this.active||this.phase!=='lobby')return r;const enemyId=localViewTeam===0?'teamBRoster':'teamARoster',enemy=$(enemyId);if(enemy)enemy.querySelectorAll('.lobby-slot:not(.empty-slot)').forEach(row=>{const small=row.querySelector('small');if(small)small.textContent=row.classList.contains('npc-slot')?'LOADOUT HIDDEN / ENEMY NPC':'LOADOUT HIDDEN / ENEMY TEAM';});if($('netWarning'))$('netWarning').textContent=(location.protocol==='file:'?'注意：file:// のURLは別PCへ共有できません。HTTPSで公開してください。 ':'')+'敵チームのアセンブルは出撃まで非公開。NPCはホストのみ追加・削除可能です。';return r;};
+
+ // Stamp projectile spawns with authoritative game time. Planned missiles can locally
+ // fast-forward a small amount when a high-latency reliable spawn arrives, reducing the visual
+ // feeling that a missile starts behind the host simulation.
+ const projectilePacket109Base=NET.projectilePacket.bind(NET);
+ NET.projectilePacket=function(b){const o=projectilePacket109Base(b);o.hostGameTime=time;return o;};
+ const receiveSpawn109Base=NET.receiveProjectileSpawn.bind(NET);
+ NET.receiveProjectileSpawn=function(data){const existed=projectiles.some(b=>b.id===data?.id),r=receiveSpawn109Base(data),b=projectiles.find(x=>x.id===data?.id);if(!existed&&b&&b.plan&&Number.isFinite(data?.hostGameTime)){const catchup=clamp(time-data.hostGameTime,0,.16);if(catchup>0){b.age=(Number(b.age)||0)+catchup;try{this.restorePlan(b.plan);const u=clamp(b.age/Math.max(.0001,b.plan.duration),0,b.plan.impactT??1);b.p=curvePoint(b.plan,u);}catch{}}}return r;};
+
+ // -------- Owner projectile reliability --------
+ // The global projectile batch is realtime/unreliable by design. A remote pilot now also receives
+ // their own short-lived rounds over the reliable control channel so their trajectory never simply vanishes.
+ const fireRound109Base=fireRound;
+ fireRound=function(f,commit,index){const firstId=nextObject,r=fireRound109Base(f,commit,index);if(NET.active&&NET.isHost&&NET.phase==='match'&&NET.humanSlots.has(f.id)&&f.id!==NET.localSlot){const spawned=projectiles.filter(b=>b.id>=firstId&&b.owner===f);if(spawned.length)NET.sendToSlot(f.id,{t:'owner_projectile_batch',bs:spawned.slice(0,20).map(b=>NET.projectilePacket(b))},false);}return r;};
+ NET.receiveOwnerProjectileBatch=function(list){if(!Array.isArray(list))return;this.receiveProjectileBatch(list);const now=performance.now();for(const d of list){const b=projectiles.find(x=>x.id===d.id);if(!b)continue;b._ownerReliableVisual=true;b._ownerSpawnAt=now;const pending=this.pendingOwnerProjectileMotion.get(b.id);if(pending){b._ownerNetP=this.clone(pending.p);b._ownerNetVel=this.clone(pending.vel)||[0,0,0];b._ownerNetRecv=now;if(Number.isFinite(pending.age))b.age=Math.max(Number(b.age)||0,pending.age-.02);this.pendingOwnerProjectileMotion.delete(b.id);}}};
+ NET.ownerProjectileState=function(b){return{id:b.id,p:this.clone(b.p),vel:this.clone(b.vel),age:b.age,life:b.life};};
+ NET.sendOwnerProjectiles=function(){if(!this.isHost||this.phase!=='match')return;for(const slot of this.humanSlots){if(slot===this.localSlot)continue;const ps=projectiles.filter(b=>b.owner?.id===slot&&isDirectVisual(b)).slice(-32).map(b=>this.ownerProjectileState(b));this.sendToSlot(slot,{t:'owner_projectiles',q:++this.ownerProjectileSeq,ps},true);}};
+ const sendMotion109Base=NET.sendMotion.bind(NET);NET.sendMotion=function(){sendMotion109Base();this.sendOwnerProjectiles();};
+ NET.receiveOwnerProjectiles=function(d){if(!d||!Array.isArray(d.ps)||!player)return;if(Number.isFinite(d.q)&&d.q<=this.lastOwnerProjectileSeq)return;if(Number.isFinite(d.q))this.lastOwnerProjectileSeq=d.q;const now=performance.now(),ids=new Set(d.ps.map(p=>p.id));for(const m of d.ps){const b=projectiles.find(x=>x.id===m.id);if(!b){this.pendingOwnerProjectileMotion.set(m.id,this.clone(m));continue;}b._ownerReliableVisual=true;b._ownerNetP=this.clone(m.p);b._ownerNetVel=this.clone(m.vel)||[0,0,0];b._ownerNetRecv=now;b._ownerGoneAt=0;if(Number.isFinite(m.age))b.age=Math.max(Number(b.age)||0,m.age-.02);if(Number.isFinite(m.life))b.life=m.life;}for(const b of projectiles)if(b.owner?.id===this.localSlot&&b._ownerReliableVisual&&isDirectVisual(b)&&!ids.has(b.id)&&now-(b._ownerSpawnAt||0)>90)b._ownerGoneAt=now;};
+
+ // Critical client-only packets handled on both channels. Reliable owner_projectile_batch is the
+ // fallback; the 20 Hz owner_projectiles stream supplies smooth positions and authoritative removal.
+ const guestData109Base=NET.onGuestData.bind(NET);NET.onGuestData=function(d){this.lastHostPacket=performance.now();if(d?.t==='owner_projectile_batch'){this.receiveOwnerProjectileBatch(d.bs);return;}if(d?.t==='owner_projectiles'){this.receiveOwnerProjectiles(d);return;}return guestData109Base(d);};
+ const guestRT109Base=NET.onGuestRealtime.bind(NET);NET.onGuestRealtime=function(d){this.lastHostPacket=performance.now();if(d?.t==='owner_projectiles'){this.receiveOwnerProjectiles(d);return;}if(d?.t==='owner_projectile_batch'){this.receiveOwnerProjectileBatch(d.bs);return;}return guestRT109Base(d);};
+
+ // Preserve a recently confirmed owner projectile across a slightly older 2 Hz world packet.
+ const applySnapshot109Base=NET.applySnapshot.bind(NET);NET.applySnapshot=function(s){const now=performance.now(),keep=new Map(projectiles.filter(b=>b.owner?.id===this.localSlot&&b._ownerReliableVisual&&(!b._ownerGoneAt)&&b._ownerNetRecv&&now-b._ownerNetRecv<180).map(b=>[b.id,b]));const r=applySnapshot109Base(s),present=new Set(projectiles.map(b=>b.id));for(const [id,b] of keep)if(!present.has(id))projectiles.push(b);for(const b of projectiles)if(b.owner?.id===this.localSlot)b.visible=true;return r;};
+
+ // Planned arc missiles are deterministic once spawned, so let the client animate their curve locally.
+ // Only homing missiles need high-frequency authoritative correction; send those every 20 Hz in compact form.
+ NET.missileMotionState=function(b){return{id:b.id,p:this.clone(b.p),vel:this.clone(b.vel),age:b.age,life:b.life,delay:b.delay||0,targetId:b.target?.id??null};};
+ const makeMotion109Base=NET.makeMotion.bind(NET);NET.makeMotion=function(){const p=makeMotion109Base();p.missiles=projectiles.filter(b=>!!b.homing).slice(-48).map(b=>this.missileMotionState(b));return p;};
+ const interpolate109Base=NET.interpolate.bind(NET);NET.interpolate=function(dt){interpolate109Base(dt);if(this.isHost||this.phase!=='match')return;const now=performance.now();for(const b of projectiles){if(b.owner?.id===this.localSlot)b.visible=true;if(Array.isArray(b._ownerNetP)){const age=clamp((now-(b._ownerNetRecv||now))/1000,0,.12),target=V.add(b._ownerNetP,V.mul(b._ownerNetVel||[0,0,0],Math.min(.06,age+.015))),d=Math.hypot(...V.sub(target,b.p));b.p=d>5?[...target]:V.lerp(b.p,target,1-Math.exp(-dt*26));b.vel=V.lerp(b.vel||[0,0,0],b._ownerNetVel||[0,0,0],1-Math.exp(-dt*22));}}
+  projectiles=projectiles.filter(b=>!b._ownerGoneAt||now-b._ownerGoneAt<45);return;};
+
+ // 20 Hz motion can report a death/state transition before the slower world packet.
+ // Handle those transitions immediately so a client never remains spectating its destroyed mech
+ // or silently skips the ENGAGE transition while waiting for the next 2 Hz snapshot.
+ const applyMotion109TransitionBase=NET.applyMotion.bind(NET);
+ NET.applyMotion=function(d){const wasState=state,wasDead=!!player?.dead,oldView=viewId,r=applyMotion109TransitionBase(d);if(!this.isHost&&this.phase==='match'){if(wasState==='countdown'&&state==='battle')call('ENGAGE','ホスト同期 / 部隊視界共有',1.2);if(!wasDead&&player?.dead){toast('自機撃破 — 残る味方を観戦',C.red);nextView();}else{const viewed=actors.find(f=>f.id===oldView);if(viewed?.dead&&isSpectating())nextView();}}return r;};
+
+ const launch109Base=NET.launchLocal.bind(NET);NET.launchLocal=function(config,hostGesture=false){this.lastOwnerProjectileSeq=-1;this.ownerProjectileSeq=0;this.pendingOwnerProjectileMotion.clear();return launch109Base(config,hostGesture);};
+ try{Object.defineProperty(window,'ironFrontClientStatus',{configurable:true,get:()=>({version:'10.9',artillery,artilleryFocus:artilleryFocus?[...artilleryFocus]:null,ownProjectiles:projectiles.filter(b=>b.owner?.id===NET.localSlot).length,hiddenLobbySlots:[...NET.lobbyHiddenSlots],lastOwnerProjectileSeq:NET.lastOwnerProjectileSeq,missiles:projectiles.filter(b=>b.homing||b.plan).length})});}catch{}
+})();
+
 for(const [id,key] of [['frameSel','f'],['mainSel','g'],['shoulderSel','s'],['gadgetSel','u']])$(id).addEventListener('change',e=>{if(NET.active&&NET.phase==='lobby')editSlot=NET.localSlot;settings.loads[editSlot][key]=Number(e.target.value);makePreview();updateSelections();save();sound.init();sound.play('ui');});
 for(const [id,key] of [['mapSel','map'],['difficulty','difficulty'],['quality','quality'],['modeSel','mode']])$(id).addEventListener('change',e=>{if(NET.active&&NET.phase==='lobby'&&!NET.isHost&&['map','difficulty','mode'].includes(key)){updateSelections();NET.renderLobby();return;}if(NET.active&&key==='mode'){settings.mode='player';updateSelections();return;}settings[key]=['quality','mode'].includes(key)?e.target.value:Number(e.target.value);updateSelections();save();sound.init();sound.play('ui');});
 document.querySelectorAll('[data-preset]').forEach(b=>b.addEventListener('click',()=>{if(NET.active&&NET.phase==='lobby')editSlot=NET.localSlot;settings.loads[editSlot]={...PRESETS[b.dataset.preset]};makePreview();updateSelections();save();sound.init();sound.play('ui');}));
@@ -2478,7 +2585,7 @@ function showModeSelect(){if(BalanceLab.remoteApplied)BalanceLab.restoreLocalSes
 let last=performance.now(),acc=0,raf=0,frameMS=16;
 function loop(now){try{const dt=clamp((now-last)/1000,0,.12);last=now;visualTime+=dt;frameMS=mix(frameMS,dt*1000,.05);const remoteClient=NET.active&&!NET.isHost&&NET.phase==='match';if(remoteClient)NET.frameUpdate(dt);if(state!=='menu')camera(dt);if((NET.active?NET.isHost:!paused)&&['countdown','battle','ending'].includes(state)){acc+=dt;let n=0;while(acc>=1/60&&n<8){step(1/60);acc-=1/60;n++;}if(n>=8)acc=0;}else acc=0;camera(state==='menu'?dt:0);if(state!=='menu')updatePlayerAim();if(!remoteClient)NET.frameUpdate(dt);drawDynamic();R.render();drawOverlay();uiTimer-=dt;if(uiTimer<=0){hud();uiTimer=.10;}raf=requestAnimationFrame(loop);}catch(e){runtimeError(e);}}
 raf=requestAnimationFrame(loop);
-const status=()=>({version:'10.7',state,paused,elapsed,remaining,score:[...score],counts:[actors.filter(f=>!f.dead&&f.team===0).length,actors.filter(f=>!f.dead&&f.team===1).length],order:order.type,scope,scopeZoom,artillery,artilleryFocus:artilleryFocus?[...artilleryFocus]:null,frameMS,player:player?{hp:player.hp,shield:player.shieldHP,ammo:player.ammo,reload:player.reload,charge:player.charge?{...player.charge}:null,ability:player.cfg.ability,abilityCD:player.abilityCD,retaliation:player.retaliation,position:[...player.p],velocity:[...player.vel],jetFuel:player.jetFuel,jetActive:player.jetActive,gatSpin:player.gatSpin,gatHeat:player.gatHeat,gatOverheat:player.gatOverheat,jammed:player.jammed,wireMomentum:player.wireMomentum,wire:player.wire?{anchor:[...player.wire.anchor],phase:player.wire.phase,length:player.wire.length}:null,yaw:player.yaw,pitch:player.pitch,aimError:player.aimError,kills:player.kills,damage:player.damage}:null,actors:actors.map(f=>({id:f.id,team:f.team,frame:f.cfg.short,gun:f.gun.type,position:[...f.p],hp:f.hp,dead:f.dead,damage:f.damage,kills:f.kills,seen:known(f,localViewTeam),role:f.ai.role,charge:f.charge?.total,zone:f.ai.zone})),projectiles:projectiles.length,deployables:deployables.length,smokes:smokes.length,zones:captureZones.map(z=>({name:z.name,owner:z.owner,progress:z.progress,contested:z.contested})),error:$('error').classList.contains('hidden')?null:$('errorText').textContent});
+const status=()=>({version:'10.9',state,paused,elapsed,remaining,score:[...score],counts:[actors.filter(f=>!f.dead&&f.team===0).length,actors.filter(f=>!f.dead&&f.team===1).length],order:order.type,scope,scopeZoom,artillery,artilleryFocus:artilleryFocus?[...artilleryFocus]:null,frameMS,player:player?{hp:player.hp,shield:player.shieldHP,ammo:player.ammo,reload:player.reload,charge:player.charge?{...player.charge}:null,ability:player.cfg.ability,abilityCD:player.abilityCD,retaliation:player.retaliation,position:[...player.p],velocity:[...player.vel],jetFuel:player.jetFuel,jetActive:player.jetActive,gatSpin:player.gatSpin,gatHeat:player.gatHeat,gatOverheat:player.gatOverheat,jammed:player.jammed,wireMomentum:player.wireMomentum,wire:player.wire?{anchor:[...player.wire.anchor],phase:player.wire.phase,length:player.wire.length}:null,yaw:player.yaw,pitch:player.pitch,aimError:player.aimError,kills:player.kills,damage:player.damage}:null,actors:actors.map(f=>({id:f.id,team:f.team,frame:f.cfg.short,gun:f.gun.type,position:[...f.p],hp:f.hp,dead:f.dead,damage:f.damage,kills:f.kills,seen:known(f,localViewTeam),role:f.ai.role,charge:f.charge?.total,zone:f.ai.zone})),projectiles:projectiles.length,deployables:deployables.length,smokes:smokes.length,zones:captureZones.map(z=>({name:z.name,owner:z.owner,progress:z.progress,contested:z.contested})),error:$('error').classList.contains('hidden')?null:$('errorText').textContent});
 Object.defineProperty(window,'ironFrontStatus',{get:status});
 if(location.hash==='#debug')window.__test={start:startMatch,stop:()=>cancelAnimationFrame(raf),step,update:updateMech,shoot,shoulder,gadget,ability,damage,kill,explode,physics,resolve,nav:navPath,detect,projectileStep,deployableStep,reload,command,nextView,pause:pauseGame,menu:toMenu,ground,normalAt,lineClear,sightClear,pointVisible,worldHit,planArc,curvePoint,muzzle,facing,aimRay,mainRig,shieldIntersection,updateObjectives,checkVictory,camera,render:()=>{camera(1/30);updatePlayerAim();drawDynamic();R.render();drawOverlay();hud();},get:()=>({actors,player,settings,objects,projectiles,deployables,smokes,keys,pressed,R,preview,effects,FRAMES,GUNS,SHOULDERS,GADGETS,captureZones,cameraAim,actualAim,score,sensorCache}),state:s=>{state=s;paused=false;},elapsed:t=>{elapsed=t;remaining=480-t;},setView:i=>viewId=i,setCamera:(yaw,pitch,distance=21)=>{camYaw=yaw;camPitch=pitch;camDist=distance;},setScore:(a,b)=>score=[a,b],setKeys:list=>{keys=new Set(list);},setMouse:(a,b)=>{if(a&&!left)pressed.add('Mouse0');left=a;right=b;},newMech:(id,team,load)=>new Mech(id,team,load),MAPS,wireVaultPlan,updateGatling,meleeWeaponTransform,discPath,bounceDisc,deployBarricade,cleanupBarricades,updateHazards,fireRepulsor,drawV7HUD,worldNormal,newBullet,updateJet,solveArtillery,artilleryCamera,panArtillery,enterArtillery,meleeContact,resolveMelee,makeMelee,updateMelee,steerMelee,updateMapMechanics,buildWorld,weaponParameters,supportHeight,surfaceY,surfaceHit,performScan,routeDeck,updatePlayerAim,validFoot,fireMain,aiIntent,toward,safeDeployPoint,drawMech,drawDynamic,drawOverlay,playerIntent,warningItems,warningTime,drawRangeCircle,drawMeleeWeapon,drawWire,grenadePreview,wireAim,activateWire,releaseWire,updateWire,wireAI,wireOrigin,planBallistic,newGrenade,configureCluster,splitCluster,predictionWidth,bulletRadius,launchMissile,world:()=>({surfaces,scanPulses,hazards}),setPressed:list=>{pressed=new Set(list);},setArtilleryTarget:p=>{artilleryFocus=[...p];},setAimMode:(v,z=false)=>{scope=v;scopeZoom=z;},decoys:()=>decoys,combatEntities,launchHoming,pickHomingTarget,phaseWorldHit,phaseClear,updateDecoys,updateV8Mech,beginContactStrike,library,openLibrary,closeLibrary,renderLibrary,chooseLibrary,librarySelect,MAPS,nearestEnemy,stopMelee:stopMeleeMotion,steerGuided,drawV9World,tomahawkFlightTransform,v9FrameStep,updateV9World,damageDeployable,cleanupBarricades,updateGates,gateDestinationFree,sensors,v9:()=>({burnZones,stickyCharges,prismDefinitions,gatePairs}),setProjectiles:bs=>projectiles=bs,setActors:fs=>{actors=fs;player=fs[0];viewId=fs[0]?.id||0;},setTime:t=>time=t,initV9UI,status};
 })();
